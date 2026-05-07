@@ -265,8 +265,8 @@ exports[`issue-3789-1.js format 1`] = `
      :     return 1;
      :   }
      :
-     :   dontTouchThis() {
-     :     return 2;
+     :   dontTouchThis(){
+     :     return 2    ;
      :   }
      : }
      :
@@ -297,8 +297,8 @@ exports[`issue-3789-2.js format 1`] = `
      :     return 1;
      :   }
      :
-     :   dontTouchThis() {
-     :     return 2;
+     :   dontTouchThis(){
+     :     return 2    ;
      :   }
      : }
      :
@@ -424,6 +424,84 @@ exports[`issue-12540.js format 1`] = `
     : let i = "format me!";
     :
     : ================================================================================
+`;
+
+exports[`issue-16140-quote-pair.js format 1`] = `
+    : ====================================options=====================================
+    : parsers: ["babel", "flow", "typescript"]
+    : rangeEnd: 257
+    : rangeStart: 239
+    :                                                       printWidth: 80 (default) |
+    : =====================================input======================================
+  1 | // Regression: changing quote style should always update both quotes on a
+  2 | // line, never split them. Line-level (not character-level) diffing ensures
+  3 | // a matching quote pair is applied together when the line overlaps the user's
+  4 | // range.
+> 5 | let s = 'in range';
+    | ^^^^^^^^^^^^^^^^^^
+  6 | let t = 'out of range';
+  7 |
+    : =====================================output=====================================
+    : // Regression: changing quote style should always update both quotes on a
+    : // line, never split them. Line-level (not character-level) diffing ensures
+    : // a matching quote pair is applied together when the line overlaps the user's
+    : // range.
+    : let s = "in range";
+    : let t = 'out of range';
+    :
+    : ================================================================================
+`;
+
+exports[`issue-16140-range-start-zero.js format 1`] = `
+    : ====================================options=====================================
+    : parsers: ["babel", "flow", "typescript"]
+    : rangeEnd: 13
+    : rangeStart: 0
+    :                                                       printWidth: 80 (default) |
+    : =====================================input======================================
+> 1 | let a    = 1;
+    | ^^^^^^^^^^^^^
+  2 | let  b   = 2;
+  3 |
+    : =====================================output=====================================
+    : let a = 1;
+    : let  b   = 2;
+    :
+    : ================================================================================
+`;
+
+exports[`issue-16140-restrict-to-selection.js format 1`] = `
+     : ====================================options=====================================
+     : parsers: ["babel", "flow", "typescript"]
+     : rangeEnd: 359
+     : rangeStart: 344
+     :                                                       printWidth: 80 (default) |
+     : =====================================input======================================
+   1 | // Regression: when the calculated range expands beyond the user's selection,
+   2 | // formatting changes outside the original range should NOT be applied. Here
+   3 | // only \`let a\` is in the selection, so \`let  b\` should keep its bad spacing
+   4 | // even though both are inside the same VariableDeclaration that prettier
+   5 | // extracts to format.
+   6 | function f() {
+>  7 |   let a    = 1;
+     | ^^^^^^^^^^^^^^^
+   8 |   let  b   = 2;
+   9 |   let   c  = 3;
+  10 | }
+  11 |
+     : =====================================output=====================================
+     : // Regression: when the calculated range expands beyond the user's selection,
+     : // formatting changes outside the original range should NOT be applied. Here
+     : // only \`let a\` is in the selection, so \`let  b\` should keep its bad spacing
+     : // even though both are inside the same VariableDeclaration that prettier
+     : // extracts to format.
+     : function f() {
+     :   let a = 1;
+     :   let  b   = 2;
+     :   let   c  = 3;
+     : }
+     :
+     : ================================================================================
 `;
 
 exports[`large-dict.js format 1`] = `
@@ -702,7 +780,8 @@ exports[`nested.js format 1`] = `
     :   if (condition) {
     :     body;
     :   }
-    : } catch (err) {}
+    : }
+    : catch (err) {}
     :
     : ================================================================================
 `;

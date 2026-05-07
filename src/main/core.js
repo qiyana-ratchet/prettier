@@ -181,9 +181,31 @@ async function coreFormat(originalText, opts, addAlignmentSize = 0) {
   return { formatted: result.formatted, cursorOffset: -1, comments };
 }
 
+function applyEndOfLine(formatted, cursorOffset, opts) {
+  if (opts.endOfLine === "lf") {
+    return { formatted, cursorOffset };
+  }
+  const eol = convertEndOfLineOptionToCharacter(opts.endOfLine);
+  if (cursorOffset >= 0 && eol === "\r\n") {
+    cursorOffset += countEndOfLineCharacters(
+      formatted.slice(0, cursorOffset),
+      "\n",
+    );
+  }
+  return { formatted: formatted.replaceAll("\n", eol), cursorOffset };
+}
+
 async function formatRange(originalText, opts) {
   const { ast, text } = await parseText(originalText, opts);
-  const [rangeStart, rangeEnd] = calculateRange(text, opts, ast) ?? [0, 0];
+  const calculatedRange = calculateRange(text, opts, ast);
+  if (!calculatedRange) {
+    return {
+      formatted: originalText,
+      cursorOffset: opts.cursorOffset,
+      comments: [],
+    };
+  }
+  const [rangeStart, rangeEnd] = calculatedRange;
   const rangeString = text.slice(rangeStart, rangeEnd);
 
   // Try to extend the range backwards to the beginning of the line.
@@ -218,31 +240,211 @@ async function formatRange(originalText, opts) {
   // we need to remove the newline that was inserted by the `format` call.
   const rangeTrimmed = rangeResult.formatted.trimEnd();
 
-  let { cursorOffset } = opts;
-  if (cursorOffset > rangeEnd) {
-    // handle the case where the cursor was past the end of the range
-    cursorOffset += rangeTrimmed.length - rangeString.length;
-  } else if (rangeResult.cursorOffset >= 0) {
-    // handle the case where the cursor was in the range
-    cursorOffset = rangeResult.cursorOffset + rangeStart;
-  }
-  // keep the cursor as it was if it was before the start of the range
+  // The user's originally requested range. `calculateRange` may have expanded
+  // it to statement/declaration boundaries to obtain a parseable substring;
+  // we use the original here to restrict which formatting changes are kept.
+  const userRangeStart = opts.rangeStart;
+  const userRangeEnd = Math.min(opts.rangeEnd, text.length);
 
-  let formatted =
-    text.slice(0, rangeStart) + rangeTrimmed + text.slice(rangeEnd);
-  if (opts.endOfLine !== "lf") {
-    const eol = convertEndOfLineOptionToCharacter(opts.endOfLine);
-    if (cursorOffset >= 0 && eol === "\r\n") {
-      cursorOffset += countEndOfLineCharacters(
-        formatted.slice(0, cursorOffset),
-        "\n",
-      );
+  let { cursorOffset } = opts;
+
+  // Fast path: when the calculated range fits entirely inside the user's
+  // selection, every change is in-bounds and we can apply the formatted range
+  // wholesale. This preserves existing behavior for the common case.
+  if (rangeStart >= userRangeStart && rangeEnd <= userRangeEnd) {
+    if (cursorOffset > rangeEnd) {
+      // Cursor was past the end of the formatted region — shift by the
+      // length delta introduced by formatting.
+      cursorOffset += rangeTrimmed.length - rangeString.length;
+    } else if (rangeResult.cursorOffset >= 0) {
+      // Cursor was inside the formatted region — translate using the offset
+      // computed by the inner format call.
+      cursorOffset = rangeResult.cursorOffset + rangeStart;
+    }
+    // Otherwise (cursor before the range) leave it untouched.
+
+    const formatted =
+      text.slice(0, rangeStart) + rangeTrimmed + text.slice(rangeEnd);
+    return {
+      ...applyEndOfLine(formatted, cursorOffset, opts),
+      comments: rangeResult.comments,
+    };
+  }
+
+  // The calculated range exceeds the user's selection. Use a line-level diff
+  // to identify which changes overlap the user's range, then keep only those.
+  // Line-level (not character-level) diffing is intentional: it ensures that
+  // related changes on the same line — e.g. matching quote pairs in
+  // `'foo'` -> `"foo"` — are always applied together. A character-level diff
+  // would split such pairs across hunks and could leave invalid output like
+  // `"foo'` if the closing-quote hunk fell outside the user's selection.
+  const origLines = rangeString.split("\n");
+  const fmtLines = rangeTrimmed.split("\n");
+  const lineDiffs = diffArrays(origLines, fmtLines);
+
+  // Map the user range from absolute offsets to line indices within
+  // `rangeString`. Both bounds are clamped to the extracted range so
+  // out-of-range inputs produce well-defined line indices.
+  const userStartInRange = Math.min(
+    rangeString.length,
+    Math.max(0, userRangeStart - rangeStart),
+  );
+  const userEndInRange = Math.min(
+    rangeString.length,
+    Math.max(userStartInRange, userRangeEnd - rangeStart),
+  );
+  const lineOf = (offset) => {
+    let count = 0;
+    for (let i = 0; i < offset; i++) {
+      if (rangeString.charCodeAt(i) === 10 /* \n */) {
+        count++;
+      }
+    }
+    return count;
+  };
+  const userStartLine = lineOf(userStartInRange);
+  const userEndLine = lineOf(userEndInRange);
+
+  // `cursorInRange` is the cursor offset relative to `rangeString`, or -1 if
+  // the cursor is outside the calculated range. We map it through the diff
+  // by walking the entries and tracking three running positions:
+  //   origCharPos   — chars consumed from `rangeString`
+  //   appliedLength — length of the assembled output so far
+  //   fmtCharPos    — chars consumed from `rangeTrimmed` (used to interpret
+  //                   `rangeResult.cursorOffset`)
+  const cursorInRange =
+    opts.cursorOffset > rangeStart && opts.cursorOffset <= rangeEnd
+      ? opts.cursorOffset - rangeStart
+      : -1;
+
+  let origCharPos = 0;
+  let appliedLength = 0;
+  let fmtCharPos = 0;
+  let mappedCursor = -1; // -1 means we have not yet placed the cursor
+
+  const resultLines = [];
+  let idx = 0;
+
+  while (idx < lineDiffs.length) {
+    const entry = lineDiffs[idx];
+
+    if (!entry.added && !entry.removed) {
+      // Unchanged region — copy lines through verbatim.
+      const text = entry.value.join("\n");
+      // Account for the join("\n") between this region and the previous
+      // group (handled implicitly by resultLines.join later).
+      const segLen = text.length;
+      if (
+        cursorInRange >= 0 &&
+        mappedCursor < 0 &&
+        cursorInRange >= origCharPos &&
+        cursorInRange <= origCharPos + segLen
+      ) {
+        mappedCursor =
+          rangeStart + appliedLength + (cursorInRange - origCharPos);
+      }
+      resultLines.push(...entry.value);
+      origCharPos += segLen + 1; // +1 for the joining "\n"
+      appliedLength += segLen + 1;
+      fmtCharPos += segLen + 1;
+      idx++;
+      continue;
     }
 
-    formatted = formatted.replaceAll("\n", eol);
+    // Group consecutive removed / added entries into a single change.
+    const removedLines = [];
+    const addedLines = [];
+    while (
+      idx < lineDiffs.length &&
+      (lineDiffs[idx].removed || lineDiffs[idx].added)
+    ) {
+      if (lineDiffs[idx].removed) {
+        removedLines.push(...lineDiffs[idx].value);
+      } else {
+        addedLines.push(...lineDiffs[idx].value);
+      }
+      idx++;
+    }
+
+    const removedText = removedLines.join("\n");
+    const addedText = addedLines.join("\n");
+    const removedSegLen =
+      removedLines.length === 0 ? 0 : removedText.length + 1;
+    const addedSegLen = addedLines.length === 0 ? 0 : addedText.length + 1;
+
+    // The change's original line span is [changeStartLine, changeEndLine).
+    const changeStartLine = lineOf(origCharPos);
+    const changeEndLine = changeStartLine + removedLines.length;
+    const overlapsUserRange =
+      changeEndLine > userStartLine && changeStartLine <= userEndLine;
+
+    if (overlapsUserRange) {
+      // Apply the formatted version.
+      if (
+        cursorInRange >= 0 &&
+        mappedCursor < 0 &&
+        cursorInRange >= origCharPos &&
+        cursorInRange <= origCharPos + removedSegLen
+      ) {
+        // The cursor was inside the original content of this hunk. Use the
+        // formatter's cursor offset (within `rangeTrimmed`) to place it,
+        // accounting for any earlier formatted hunks we have skipped.
+        if (
+          rangeResult.cursorOffset >= 0 &&
+          rangeResult.cursorOffset >= fmtCharPos &&
+          rangeResult.cursorOffset <= fmtCharPos + addedSegLen
+        ) {
+          mappedCursor =
+            rangeStart +
+            appliedLength +
+            (rangeResult.cursorOffset - fmtCharPos);
+        } else {
+          // Fall back to the end of this applied hunk.
+          mappedCursor = rangeStart + appliedLength + addedSegLen;
+        }
+      }
+      resultLines.push(...addedLines);
+      origCharPos += removedSegLen;
+      appliedLength += addedSegLen;
+      fmtCharPos += addedSegLen;
+    } else {
+      // Reject this change — keep the original text for this hunk.
+      if (
+        cursorInRange >= 0 &&
+        mappedCursor < 0 &&
+        cursorInRange >= origCharPos &&
+        cursorInRange <= origCharPos + removedSegLen
+      ) {
+        mappedCursor =
+          rangeStart + appliedLength + (cursorInRange - origCharPos);
+      }
+      resultLines.push(...removedLines);
+      origCharPos += removedSegLen;
+      appliedLength += removedSegLen;
+      fmtCharPos += addedSegLen; // skip the formatted version
+    }
   }
 
-  return { formatted, cursorOffset, comments: rangeResult.comments };
+  const appliedString = resultLines.join("\n");
+  const appliedDelta = appliedString.length - rangeString.length;
+
+  if (cursorOffset > rangeEnd) {
+    // Cursor was past the end of the calculated range — shift by the actual
+    // length delta of what we ended up applying (NOT `rangeTrimmed.length -
+    // rangeString.length`, which would over-count the rejected hunks).
+    cursorOffset += appliedDelta;
+  } else if (mappedCursor >= 0) {
+    cursorOffset = mappedCursor;
+  }
+  // Otherwise (cursor before the range, or unmapped) leave it untouched.
+
+  const formatted =
+    text.slice(0, rangeStart) + appliedString + text.slice(rangeEnd);
+
+  return {
+    ...applyEndOfLine(formatted, cursorOffset, opts),
+    comments: rangeResult.comments,
+  };
 }
 
 function ensureIndexInText(text, index, defaultValue) {

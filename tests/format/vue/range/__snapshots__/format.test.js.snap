@@ -25,7 +25,8 @@ exports[`example.vue format 1`] = `
   13 |
      : =====================================output=====================================
      : <template>
-     :   <p>Templates are formatted as well...</p>
+     :   <p>Templates are formatted as well...
+     :     </p>
      : </template>
      :
      : <script>
@@ -35,9 +36,8 @@ exports[`example.vue format 1`] = `
      : </script>
      :
      : <style>
-     : .and {
-     :   css: too !important;
-     : }
+     : .and { css: too !important }
      : </style>
+     :
      : ================================================================================
 `;
